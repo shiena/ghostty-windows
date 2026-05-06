@@ -29,6 +29,21 @@ pub const must_draw_from_app_thread = false;
 /// core_app.tick() is called.
 const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 
+/// Custom window message that defers `Surface.positionImeWindow` to the
+/// next message-pump tick instead of calling it synchronously from the
+/// WM_IME_STARTCOMPOSITION / WM_IME_COMPOSITION handler. The deferral
+/// matters because `ImmSetCompositionWindow` / `ImmSetCandidateWindow`
+/// inside a TSF TIP (e.g. corvus-skk) can synchronously fire
+/// `NotifyWinEvent(EVENT_OBJECT_IME_*)`, which routes through `oleacc`
+/// and ends in `SleepConditionVariableSRW` waiting for a COM marshaling
+/// reply. With a deep WindowProc chain on the stack, the UI thread can't
+/// pump messages for that reply and the process hangs. Posting the
+/// repositioning to a top-level dispatch tick keeps the chain shallow.
+/// Both rio (`update_ime_cursor_position_if_needed` after redraw) and
+/// wezterm (`spawn_into_main_thread` in `with_window_inner`) defer this
+/// the same way.
+pub const WM_APP_POSITION_IME: u32 = w32.WM_APP + 4;
+
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
 
@@ -1784,27 +1799,39 @@ fn surfaceWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
+        WM_APP_POSITION_IME => {
+            // Deferred IME repositioning posted from the IME composition
+            // handlers. See `Surface.queueImeReposition` for why we don't
+            // call this synchronously from WM_IME_*.
+            surface.positionImeWindow();
+            return 0;
+        },
 
         w32.WM_IME_STARTCOMPOSITION => {
             surface.handleImeStartComposition();
-            // Let DefWindowProc show the default composition window.
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            // Skip DefWindowProc. The default handler runs a synchronous
+            // handshake with the IME that blocks the message thread for
+            // ~100 ms before the paired WM_IME_COMPOSITION arrives — that
+            // wait capped direct-input IME (corvus-skk hiragana) auto-
+            // repeat at ~10 cps. Preedit is rendered inline at the cursor
+            // by the terminal renderer (driven by handleImeComposition's
+            // GCS_COMPSTR branch), so the OS default composition window
+            // is unnecessary.
+            return 0;
         },
 
         w32.WM_IME_COMPOSITION => {
-            if (surface.handleImeComposition(lparam)) {
-                // We extracted the result string — suppress further
-                // processing so WM_IME_CHAR/WM_CHAR are not generated.
-                return 0;
-            }
-            // No result string yet (intermediate composition) — let
-            // DefWindowProc update the default composition window.
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            // Always consume — we render preedit ourselves and don't want
+            // DefWindowProc to update the default composition window or
+            // generate WM_IME_CHAR / WM_CHAR for the result string.
+            surface.handleImeComposition(lparam);
+            return 0;
         },
 
         w32.WM_IME_ENDCOMPOSITION => {
             surface.handleImeEndComposition();
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            // Skip DefWindowProc; same handshake stall as STARTCOMPOSITION.
+            return 0;
         },
 
         w32.WM_LBUTTONDOWN => {

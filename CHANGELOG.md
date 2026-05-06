@@ -14,6 +14,47 @@ the underlying upstream commit when known.
   it; mode switches live without a Ghostty restart. Mouse drag, hover, and
   page-click work; clicks fall through to the terminal when the scrollbar
   is hidden.
+- IME preedit (composition) text is now drawn inline at the terminal cursor
+  via the core `preeditCallback` path (the same one GTK / macOS use), so
+  MS-IME / Google Japanese Input / ATOK / mozc preedit underline shows up
+  in the terminal grid instead of in a Windows-default popup.
+- IME conversion candidate window is now anchored to the cursor cell via
+  `ImmSetCandidateWindow(CFS_EXCLUDE)` (matching wezterm). The earlier
+  code only set `ImmSetCompositionWindow`, which most IMEs ignore for
+  candidate placement — without a candidate-form hint they fell back to
+  the bottom-right of the desktop. The rect is computed from the cursor
+  row/column and physical cell dimensions directly instead of going
+  through `Surface.imePoint()`, whose content-scale division (a macOS
+  NSTextInputClient quirk) made the candidate window land inside the
+  preedit row on high-DPI displays.
+- IMM composition / candidate anchor is resynced after every rendered
+  frame so it tracks cursor moves that happen between IME events.
+  Without this, only `WM_IME_*` events updated the anchor, so anything
+  that moved the cursor between compositions — `Ctrl-U` erasing a line
+  in pwsh, an ncurses redraw, an ANSI cursor jump — left the anchor
+  pinned to wherever the previous composition ended. The next
+  `WM_IME_STARTCOMPOSITION` is a `SendMessage` from the IME, so a TIP
+  like corvus-skk read the stale anchor for its mode marker before the
+  deferred `WM_APP_POSITION_IME` ever ran; the visible bug was the
+  kana-mode marker appearing at the cell after the just-deleted string
+  instead of at the live cursor. wezterm dodges this via
+  `set_text_cursor_position` from `paint`. An atomic dedup flag
+  collapses per-frame posts to one outstanding message, and the
+  receiver short-circuits when the anchor hasn't moved so 60 fps
+  doesn't translate to 60 redundant `NotifyWinEvent` rounds.
+
+### Changed
+- `WM_IME_STARTCOMPOSITION` and `WM_IME_ENDCOMPOSITION` are now consumed
+  (return 0) instead of forwarded to `DefWindowProc`. The default handler
+  runs a synchronous handshake with the IME that blocked the message
+  thread for ~95–100 ms before the paired `WM_IME_COMPOSITION` arrived;
+  under direct-input IMEs (e.g. corvus-skk hiragana) every keystroke fires
+  the whole START → COMPOSITION → END trio, so the OS auto-repeat was
+  capped at ~10 cps. Skipping the handshake drops the per-keystroke cycle
+  to ~31 ms, matching the OS auto-repeat cadence. `WM_IME_COMPOSITION` is
+  also always consumed now; the GCS_COMPSTR branch was added so preedit
+  can be drawn by the renderer instead of by the OS-default composition
+  window the handshake was wired to.
 
 ### Fixed
 - Alt-modified keybindings (`Alt+-`, `Alt+\`, `Alt+letter`, …) no longer

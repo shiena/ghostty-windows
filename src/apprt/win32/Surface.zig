@@ -72,6 +72,17 @@ mouse_button_mask: u3 = 0,
 /// text is extracted from WM_IME_COMPOSITION instead.
 ime_composing: bool = false,
 
+/// Last IME composition window anchor (`mid_x, cell_top` from
+/// `positionImeWindow`). Used to skip the IMM round-trip when the cursor
+/// hasn't moved between frames. UI-thread only.
+last_ime_pos: ?struct { x: i32, y: i32 } = null,
+
+/// Set to true when a `WM_APP_POSITION_IME` message is already in the
+/// queue. Lets `queueImeReposition` from any thread (notably the renderer
+/// via `signalFrameDrawn`) avoid piling up redundant posts. The receiver
+/// (`positionImeWindow` on the UI thread) clears it before doing work.
+ime_reposition_queued: std.atomic.Value(bool) = .init(false),
+
 /// Set to true when handleKeyEvent produced text via ToUnicode. The
 /// subsequent WM_CHAR from TranslateMessage is then suppressed to avoid
 /// double input. Reset to false when WM_CHAR arrives (whether suppressed
@@ -1844,66 +1855,137 @@ pub fn handleMouseWheel(self: *Surface, wparam: usize, axis: enum { vertical, ho
 }
 
 /// Handle WM_IME_STARTCOMPOSITION — an IME composition session has begun.
-/// Position the candidate window near the terminal cursor and let Windows
-/// show its default composition UI.
+/// Position the candidate window near the terminal cursor. We render the
+/// preedit ourselves through `core_surface.preeditCallback` (driven from
+/// `WM_IME_COMPOSITION` GCS_COMPSTR), so the App's WndProc returns 0 for
+/// this message instead of forwarding to `DefWindowProc` — that default
+/// handler runs a synchronous handshake with the IME that blocks the
+/// message thread for ~100 ms before the paired `WM_IME_COMPOSITION`
+/// arrives, which capped direct-input IME (corvus-skk hiragana) auto-
+/// repeat at ~10 cps.
 pub fn handleImeStartComposition(self: *Surface) void {
     self.ime_composing = true;
     // Drop any buffered high surrogate so it can't pair with IME output.
     self.high_surrogate = 0;
-    self.positionImeWindow();
+    self.queueImeReposition();
 }
 
 /// Handle WM_IME_ENDCOMPOSITION — the IME composition session has ended.
+/// Clear any preedit we set during the session: most IMEs (MS-IME, Google
+/// Japanese Input, ATOK) don't fire a final empty `WM_IME_COMPOSITION`
+/// with GCS_COMPSTR, so without this clear the last preedit string would
+/// linger on screen after the user commits or aborts.
 pub fn handleImeEndComposition(self: *Surface) void {
     self.ime_composing = false;
+    if (self.core_surface_ready) {
+        self.core_surface.preeditCallback(null) catch |err| {
+            log.warn("IME preedit clear (end) error: {}", .{err});
+        };
+    }
 }
 
-/// Handle WM_IME_COMPOSITION — intermediate or final text from the IME.
-/// When the result string is available (GCS_RESULTSTR), extract it and
-/// send it to the terminal. Returns true if we handled the result string.
-pub fn handleImeComposition(self: *Surface, lparam: isize) bool {
-    if (!self.core_surface_ready) return false;
+/// Heap-or-stack buffer returned from `readImeString`.
+const ImeBuf = struct {
+    str: []const u16,
+    heap: ?[]u16 = null,
 
-    const flags: u32 = @intCast(lparam & 0xFFFFFFFF);
-    if (flags & w32.GCS_RESULTSTR == 0) return false;
+    fn deinit(self: ImeBuf, alloc: Allocator) void {
+        if (self.heap) |h| alloc.free(h);
+    }
+};
 
-    const hwnd = self.hwnd orelse return false;
-    const himc = w32.ImmGetContext(hwnd) orelse return false;
-    defer _ = w32.ImmReleaseContext(hwnd, himc);
-
-    // Query the length of the result string (in bytes).
-    const byte_len = w32.ImmGetCompositionStringW(himc, w32.GCS_RESULTSTR, null, 0);
-    if (byte_len <= 0) return false;
+/// Read a UTF-16 string from the IME composition state for the given
+/// `GCS_*` flag. Returns null on error or odd byte count; an empty
+/// `ImeBuf` (str.len == 0) for an explicitly empty composition.
+fn readImeString(
+    self: *Surface,
+    himc: w32.HIMC,
+    flag: u32,
+    stack_buf: *[64]u16,
+) ?ImeBuf {
+    const byte_len = w32.ImmGetCompositionStringW(himc, flag, null, 0);
+    if (byte_len < 0) return null;
+    if (byte_len == 0) return .{ .str = &.{} };
     // The W variant always returns an even byte count, but reject odd
     // values defensively rather than panicking via @divExact.
-    if (byte_len & 1 != 0) return false;
-
+    if (byte_len & 1 != 0) return null;
     const u16_len: usize = @intCast(@divTrunc(byte_len, 2));
 
-    // Stack buffer for typical IME results (up to 64 UTF-16 code units).
-    var stack_buf: [64]u16 = undefined;
-
     if (u16_len <= stack_buf.len) {
-        const got = w32.ImmGetCompositionStringW(himc, w32.GCS_RESULTSTR, &stack_buf, @intCast(byte_len));
-        if (got <= 0) return false;
-        if (got & 1 != 0) return false;
-        const actual_len: usize = @intCast(@divTrunc(got, 2));
-        self.sendImeText(stack_buf[0..actual_len]);
-    } else {
-        // Unusual: very long composition. Allocate on the heap.
-        const alloc = self.app.core_app.alloc;
-        const buf = alloc.alloc(u16, u16_len) catch return false;
-        defer alloc.free(buf);
-        const got = w32.ImmGetCompositionStringW(himc, w32.GCS_RESULTSTR, buf.ptr, @intCast(byte_len));
-        if (got <= 0) return false;
-        if (got & 1 != 0) return false;
-        const actual_len: usize = @intCast(@divTrunc(got, 2));
-        self.sendImeText(buf[0..actual_len]);
+        const got = w32.ImmGetCompositionStringW(himc, flag, stack_buf, @intCast(byte_len));
+        if (got <= 0) return .{ .str = &.{} };
+        if (got & 1 != 0) return null;
+        const actual: usize = @intCast(@divTrunc(got, 2));
+        return .{ .str = stack_buf[0..actual] };
     }
 
-    // Reposition the IME window for the next composition
-    self.positionImeWindow();
-    return true;
+    // Unusual: very long composition. Allocate on the heap.
+    const alloc = self.app.core_app.alloc;
+    const buf = alloc.alloc(u16, u16_len) catch return null;
+    const got = w32.ImmGetCompositionStringW(himc, flag, buf.ptr, @intCast(byte_len));
+    if (got <= 0) {
+        alloc.free(buf);
+        return .{ .str = &.{} };
+    }
+    if (got & 1 != 0) {
+        alloc.free(buf);
+        return null;
+    }
+    const actual: usize = @intCast(@divTrunc(got, 2));
+    return .{ .str = buf[0..actual], .heap = buf };
+}
+
+/// Handle WM_IME_COMPOSITION — intermediate (preedit) and/or final
+/// (commit) text from the IME. lparam carries the GCS_* flags indicating
+/// which strings are present.
+///
+/// The caller (App.zig WndProc) always returns 0 for this message instead
+/// of forwarding to `DefWindowProc`, since we don't use the OS default
+/// composition window — preedit is drawn inline at the cursor by the
+/// terminal renderer through `preeditCallback`. Skipping `DefWindowProc`
+/// also skips its synchronous IME handshake, which was the dominant
+/// stall under direct-input IME key-repeat.
+pub fn handleImeComposition(self: *Surface, lparam: isize) void {
+    if (!self.core_surface_ready) return;
+
+    const flags: u32 = @intCast(lparam & 0xFFFFFFFF);
+    if (flags & (w32.GCS_RESULTSTR | w32.GCS_COMPSTR) == 0) return;
+
+    const hwnd = self.hwnd orelse return;
+    const himc = w32.ImmGetContext(hwnd) orelse return;
+    defer _ = w32.ImmReleaseContext(hwnd, himc);
+
+    const alloc = self.app.core_app.alloc;
+
+    // 1. Result string (commit). MS-IME, Google Japanese Input, and ATOK
+    //    all fire GCS_RESULTSTR alone on confirm — the GCS_COMPSTR branch
+    //    below never runs in that case, so the trailing preedit would
+    //    otherwise stay on screen until WM_IME_ENDCOMPOSITION. Clear it
+    //    explicitly here before injecting the committed text.
+    if (flags & w32.GCS_RESULTSTR != 0) {
+        self.core_surface.preeditCallback(null) catch |err| {
+            log.warn("IME preedit clear (commit) error: {}", .{err});
+        };
+        var stack_buf: [64]u16 = undefined;
+        if (self.readImeString(himc, w32.GCS_RESULTSTR, &stack_buf)) |buf| {
+            defer buf.deinit(alloc);
+            if (buf.str.len > 0) self.sendImeText(buf.str);
+        }
+    }
+
+    // 2. Composition string (preedit). May be empty — that means the
+    //    user backspaced past the start of the composition, which is an
+    //    explicit clear-preedit signal.
+    if (flags & w32.GCS_COMPSTR != 0) {
+        var stack_buf: [64]u16 = undefined;
+        if (self.readImeString(himc, w32.GCS_COMPSTR, &stack_buf)) |buf| {
+            defer buf.deinit(alloc);
+            self.sendImePreedit(buf.str);
+        }
+    }
+
+    // Reposition the IME window for the next composition / candidate.
+    self.queueImeReposition();
 }
 
 /// Convert a UTF-16 IME result to UTF-8 and send it to the terminal.
@@ -1940,28 +2022,140 @@ fn sendImeText(self: *Surface, utf16: []const u16) void {
     };
 }
 
-/// Position the IME candidate/composition window near the terminal cursor.
-fn positionImeWindow(self: *Surface) void {
+/// Convert a UTF-16 IME composition (preedit) string to UTF-8 and forward
+/// to the core surface so the terminal renderer draws it inline at the
+/// cursor. An empty input clears the preedit (same as null), which is
+/// what the IME sends when the user backspaces past the start.
+fn sendImePreedit(self: *Surface, utf16: []const u16) void {
+    if (utf16.len == 0) {
+        self.core_surface.preeditCallback(null) catch |err| {
+            log.warn("IME preedit clear error: {}", .{err});
+        };
+        return;
+    }
+
+    // Compositions can grow longer than the 256-byte stack buffer
+    // sendImeText uses (each CJK codepoint is 3 bytes UTF-8, 2 bytes
+    // UTF-16, so the worst-case ratio is 1.5×). Allocate so we don't
+    // truncate or have to size for the worst case on the stack.
+    const alloc = self.app.core_app.alloc;
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, utf16) catch |err| {
+        log.warn("IME preedit utf16→utf8 error: {}", .{err});
+        return;
+    };
+    defer alloc.free(utf8);
+
+    self.core_surface.preeditCallback(utf8) catch |err| {
+        log.warn("IME preedit callback error: {}", .{err});
+    };
+}
+
+/// Defer `positionImeWindow` to a top-level message-pump tick via
+/// `PostMessage(WM_APP_POSITION_IME)`. Calling the IMM positioning
+/// APIs synchronously from inside `WM_IME_STARTCOMPOSITION` /
+/// `WM_IME_COMPOSITION` could deadlock the UI thread: TSF TIPs such as
+/// corvus-skk respond to `ImmSetCompositionWindow` /
+/// `ImmSetCandidateWindow` by firing `NotifyWinEvent(EVENT_OBJECT_IME_*)`,
+/// which routes through `oleacc!CreateClient` and ends in
+/// `SleepConditionVariableSRW` waiting for a COM marshaling reply. With
+/// our WindowProc deep on the stack the thread can't pump messages for
+/// that reply, so the process hangs. rio defers via
+/// `update_ime_cursor_position_if_needed` after redraw and wezterm via
+/// `spawn_into_main_thread` in `Connection::with_window_inner`; this is
+/// the equivalent shim for Ghostty.
+///
+/// Safe to call from any thread (notably the renderer thread via
+/// `signalFrameDrawn`). The atomic guard collapses bursts of posts to
+/// one outstanding message, so a window rendering at 60 fps won't pile
+/// up a back-pressured IMM queue.
+fn queueImeReposition(self: *Surface) void {
     const hwnd = self.hwnd orelse return;
+    if (self.ime_reposition_queued.swap(true, .acq_rel)) return;
+    _ = w32.PostMessageW(hwnd, App.WM_APP_POSITION_IME, 0, 0);
+}
+
+/// Position the IME composition and candidate windows near the terminal
+/// cursor. We hand the IME both:
+///   - `ImmSetCompositionWindow` (CFS_POINT) at the cursor cell.
+///   - `ImmSetCandidateWindow` (CFS_EXCLUDE) with a cursor-anchored rect
+///     so the IME's conversion candidate list lands just below the
+///     cursor. Without a candidate-form hint MS-IME / Google Japanese
+///     Input / ATOK / mozc fall back to the bottom-right of the desktop;
+///     `ImmSetCompositionWindow` alone is not enough on most IMEs.
+///
+/// The rect convention matches rio / wezterm: anchor at midpoint-of-cell
+/// horizontally, top-of-cell vertically; rect extends one cell-width to
+/// the right and one cell-height down. CFS_EXCLUDE then places the
+/// candidate window flush against the bottom of the cell rather than
+/// indented inward.
+///
+/// Coordinates are computed directly in physical client pixels rather
+/// than through `core_surface.imePoint()`, which divides by content
+/// scale to produce the logical-pixel value macOS NSTextInputClient
+/// wants — Win32 IMM expects physical pixels, so on a high-DPI display
+/// the divided values landed inside the cell row and dragged the
+/// candidate window up to overlap the preedit text.
+///
+/// Must only be reached via `WM_APP_POSITION_IME` so the IMM calls
+/// happen at the top of a message-pump tick, not nested inside another
+/// WindowProc. See `queueImeReposition` for the rationale.
+pub fn positionImeWindow(self: *Surface) void {
+    // Clear the dedup flag first so a cursor move that lands during this
+    // call still triggers the next post. Doing it after the IMM calls
+    // would lose the wakeup if the renderer thread races us here.
+    self.ime_reposition_queued.store(false, .release);
+
+    const hwnd = self.hwnd orelse return;
+    if (!self.core_surface_ready) return;
+
+    // Read cursor under the renderer mutex (matches imePoint's pattern).
+    const cs = &self.core_surface;
+    cs.renderer_state.mutex.lock();
+    const cursor = cs.renderer_state.terminal.screens.active.cursor;
+    cs.renderer_state.mutex.unlock();
+
+    const cell_w = cs.size.cell.width;
+    const cell_h = cs.size.cell.height;
+    const cell_left: i32 = @intCast(cursor.x * cell_w + cs.size.padding.left);
+    const cell_top: i32 = @intCast(cursor.y * cell_h + cs.size.padding.top);
+    const cell_w_i: i32 = @intCast(cell_w);
+    const cell_h_i: i32 = @intCast(cell_h);
+    const mid_x: i32 = cell_left + @divFloor(cell_w_i, 2);
+
+    // Skip the IMM round-trip when the anchor hasn't moved since the
+    // last call. Otherwise every post-frame reposition fires
+    // `NotifyWinEvent(EVENT_OBJECT_IME_*)` for nothing, which several TSF
+    // TIPs (corvus-skk included) respond to with COM marshaling.
+    if (self.last_ime_pos) |last| {
+        if (last.x == mid_x and last.y == cell_top) return;
+    }
+    self.last_ime_pos = .{ .x = mid_x, .y = cell_top };
+
     const himc = w32.ImmGetContext(hwnd) orelse return;
     defer _ = w32.ImmReleaseContext(hwnd, himc);
 
-    // Use the core surface's imePoint() which calculates the cursor
-    // position in pixels from the terminal grid, accounting for padding
-    // and content scale.
-    var pos = w32.POINT{ .x = 0, .y = 0 };
-    if (self.core_surface_ready) {
-        const ime_pos = self.core_surface.imePoint();
-        pos.x = @intFromFloat(ime_pos.x);
-        pos.y = @intFromFloat(ime_pos.y);
-    }
+    const rect = w32.RECT{
+        .left = mid_x,
+        .top = cell_top,
+        .right = mid_x + cell_w_i,
+        .bottom = cell_top + cell_h_i,
+    };
+    const anchor = w32.POINT{ .x = mid_x, .y = cell_top };
 
     const cf = w32.COMPOSITIONFORM{
         .dwStyle = w32.CFS_POINT,
-        .ptCurrentPos = pos,
-        .rcArea = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+        .ptCurrentPos = anchor,
+        .rcArea = rect,
     };
     _ = w32.ImmSetCompositionWindow(himc, &cf);
+
+    const candidate = w32.CANDIDATEFORM{
+        .dwIndex = 0,
+        .dwStyle = w32.CFS_EXCLUDE,
+        .ptCurrentPos = anchor,
+        .rcArea = rect,
+    };
+    _ = w32.ImmSetCandidateWindow(himc, &candidate);
 }
 
 // -----------------------------------------------------------------------
@@ -2088,6 +2282,22 @@ pub fn signalFrameDrawn(self: *Surface) void {
     if (self.frame_event) |event| {
         _ = w32.SetEvent(event);
     }
+
+    // Keep the IME composition / candidate window position synced with
+    // whatever cursor the renderer just used. We can't make IMM calls
+    // from this (renderer) thread, so post for the UI thread.
+    //
+    // Without this, only `WM_IME_*` events update the IMM anchor, so
+    // anything that moves the cursor between compositions — Ctrl-U
+    // erasing a line in pwsh, an ncurses redraw, an ANSI cursor jump —
+    // leaves the IMM anchor pinned to wherever the previous composition
+    // ended. The next `WM_IME_STARTCOMPOSITION` is a SendMessage from
+    // the IME, so a TIP like corvus-skk reads the stale anchor for its
+    // mode marker before our deferred `WM_APP_POSITION_IME` ever runs.
+    // wezterm dodges this via `set_text_cursor_position` from `paint`,
+    // rio via `update_ime_cursor_position_if_needed` after redraw — same
+    // shape, different name.
+    self.queueImeReposition();
 }
 
 /// Handle WM_SETFOCUS / WM_KILLFOCUS.
