@@ -387,6 +387,11 @@ pub fn addTab(self: *Window) !*Surface {
         self.selectTabIndex(pos);
     }
     self.updateTabBarVisibility();
+    // Force a tab bar repaint. updateTabBarVisibility only triggers a
+    // resize (which invalidates) on the visible↔hidden transition, so
+    // 2→3, 3→4, … additions would otherwise leave the bar showing
+    // stale tab slots until some unrelated paint event arrives.
+    self.invalidateTabBar();
     return surface;
 }
 
@@ -424,6 +429,11 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     }
     self.selectTabIndex(self.active_tab);
     self.updateTabBarVisibility();
+    // Force a tab bar repaint. updateTabBarVisibility only invalidates
+    // on a visibility transition (e.g. 2→1 with auto), so 5→4, 4→3, 3→2
+    // closures would leave the bar showing stale slots until something
+    // else happens to invalidate.
+    self.invalidateTabBar();
 }
 
 /// Close tabs based on mode: this (current), other (all but current), right (all after current).
