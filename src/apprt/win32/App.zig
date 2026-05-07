@@ -275,18 +275,36 @@ pub fn run(self: *App) !void {
                 }
             }
 
-            // Find the parent surface of this edit control
+            // Find the parent surface of this edit control. Only popups
+            // (search_hwnd / palette_hwnd) are TERMINAL_CLASS_NAME, so
+            // walking up to a parent of that class lets us safely cast
+            // its GWLP_USERDATA to *Surface. Without this guard,
+            // msg.hwnd being the focused surface child HWND (the normal
+            // terminal area) makes GetParent point at the top-level
+            // GhosttyWindow whose GWLP_USERDATA holds a *Window — the
+            // cast-to-*Surface and dereference of `search_active`
+            // (offset >70 KB into Surface) walks past the *Window
+            // allocation and AVs.
             const parent = w32.GetParent(msg.hwnd.?);
-            if (parent) |p| {
+            if (parent) |p| skip: {
+                var class_buf: [32]u16 = undefined;
+                const class_len = w32.GetClassNameW(p, &class_buf, class_buf.len);
+                const expected = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyTerminal");
+                if (class_len <= 0 or
+                    @as(usize, @intCast(class_len)) != expected.len or
+                    !std.mem.eql(u16, class_buf[0..@as(usize, @intCast(class_len))], expected[0..expected.len]))
+                {
+                    break :skip;
+                }
+
                 const userdata = w32.GetWindowLongPtrW(p, w32.GWLP_USERDATA);
-                if (userdata != 0) {
-                    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
-                    if (surface.search_active and surface.search_edit == msg.hwnd) {
-                        if (surface.handleSearchKey(vk)) continue;
-                    }
-                    if (surface.palette_active and surface.palette_edit == msg.hwnd) {
-                        if (surface.handlePaletteKey(vk)) continue;
-                    }
+                if (userdata == 0) break :skip;
+                const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
+                if (surface.search_active and surface.search_edit == msg.hwnd) {
+                    if (surface.handleSearchKey(vk)) continue :loop;
+                }
+                if (surface.palette_active and surface.palette_edit == msg.hwnd) {
+                    if (surface.handlePaletteKey(vk)) continue :loop;
                 }
             }
         }

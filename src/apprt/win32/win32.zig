@@ -173,8 +173,9 @@ pub const WM_IME_COMPOSITION: u32 = 0x010F;
 pub const GCS_COMPSTR: u32 = 0x0008;
 pub const GCS_RESULTSTR: u32 = 0x0800;
 
-// IME composition form styles
+// IME composition / candidate form styles
 pub const CFS_POINT: u32 = 0x0002;
+pub const CFS_EXCLUDE: u32 = 0x0080;
 
 // Virtual key codes
 pub const VK_PROCESSKEY: u16 = 0xE5;
@@ -448,6 +449,12 @@ pub extern "user32" fn ClientToScreen(
 pub extern "user32" fn GetParent(
     hWnd: HWND,
 ) callconv(.winapi) ?HWND;
+
+pub extern "user32" fn GetClassNameW(
+    hWnd: HWND,
+    lpClassName: [*]u16,
+    nMaxCount: i32,
+) callconv(.winapi) i32;
 
 pub extern "user32" fn AdjustWindowRectEx(
     lpRect: *RECT,
@@ -970,6 +977,13 @@ pub const COMPOSITIONFORM = extern struct {
     rcArea: RECT,
 };
 
+pub const CANDIDATEFORM = extern struct {
+    dwIndex: u32,
+    dwStyle: u32,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
+};
+
 pub extern "imm32" fn ImmGetContext(
     hWnd: HWND,
 ) callconv(.winapi) ?HIMC;
@@ -989,6 +1003,11 @@ pub extern "imm32" fn ImmGetCompositionStringW(
 pub extern "imm32" fn ImmSetCompositionWindow(
     hIMC: HIMC,
     lpCompForm: *const COMPOSITIONFORM,
+) callconv(.winapi) i32;
+
+pub extern "imm32" fn ImmSetCandidateWindow(
+    hIMC: HIMC,
+    lpCandidate: *const CANDIDATEFORM,
 ) callconv(.winapi) i32;
 
 // -----------------------------------------------------------------------
