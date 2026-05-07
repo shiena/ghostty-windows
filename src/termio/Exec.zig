@@ -258,6 +258,32 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
                 else => |err| log.warn("error interrupting read thread err={}", .{err}),
             }
         }
+
+        // CancelIoEx is a no-op on ConPTY-backed master pipes when the
+        // child is still flushing output: the read thread stays parked
+        // in `ReadFile` indefinitely, `read_thread.join()` blocks the
+        // io thread, `core_surface.deinit` blocks the UI thread, and
+        // the whole tab-close UI deadlocks. Repro:
+        // .claude/tab-spam.ahk while many tabs spam OSC 2 titles.
+        //
+        // Wait briefly for the read thread to exit naturally; if it
+        // doesn't, force-close the master pipe handle so its `ReadFile`
+        // bails out with `INVALID_HANDLE` (handled in
+        // `threadMainWindows`). Mark `pty.out_pipe` as already-closed
+        // so `Pty.deinit` doesn't double-close — `CloseHandle` on a
+        // recycled value would close an unrelated object.
+        const wait_result = windows.kernel32.WaitForSingleObject(
+            exec.read_thread.getHandle(),
+            1000,
+        );
+        if (wait_result == windows.WAIT_TIMEOUT) {
+            log.warn("read thread stuck after CancelIoEx; force-closing master pipe", .{});
+            _ = windows.CloseHandle(exec.read_thread_fd);
+            if (self.subprocess.pty) |*pty| {
+                pty.out_pipe = windows.INVALID_HANDLE_VALUE;
+            }
+            exec.read_thread_fd = windows.INVALID_HANDLE_VALUE;
+        }
     }
 
     exec.read_thread.join();
@@ -395,12 +421,31 @@ fn processExitWindows(
 
     log.debug("child process exited status={} runtime={}ms", .{ exit_code, runtime_ms });
 
-    _ = surface_mailbox.push(.{
+    // Bounded push instead of `.forever`. `.forever` deadlocks under heavy
+    // tab churn: if the UI thread is inside `closeTabByIndex` waiting on
+    // `io_thr.join()` while `io_thr` is in `Exec.threadExit` waiting on
+    // `process_watcher_thread.join()`, then this thread is the only one
+    // left to make progress — but `app.mailbox` is full of surface_messages
+    // from spam, and only the UI thread's `App.tick` drains it. We'd wait
+    // on `cond_not_full` forever. Repro: `.claude/tab-spam.ahk` (60+ tabs
+    // each blasting OSC 2 titles).
+    //
+    // Dropping `child_exited` is safe: the IO thread also notices the PTY
+    // EOF and shuts down on its own; the surface just won't get the exit
+    // metadata in this rare path.
+    const pushed = surface_mailbox.push(.{
         .child_exited = .{
             .exit_code = exit_code,
             .runtime_ms = runtime_ms,
         },
-    }, .{ .forever = {} });
+    }, .{ .ns = std.time.ns_per_s });
+    if (pushed == 0) {
+        log.warn(
+            "processExitWindows: surface mailbox saturated, dropped child_exited " ++
+                "(exit_code={} runtime_ms={})",
+            .{ exit_code, runtime_ms },
+        );
+    }
 }
 
 fn termiosTimer(
@@ -1473,8 +1518,16 @@ pub const ReadThread = struct {
                 if (windows.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == 0) {
                     const err = windows.kernel32.GetLastError();
                     switch (err) {
-                        // Check for a quit signal
-                        .OPERATION_ABORTED => break,
+                        // Normal cancel via CancelIoEx.
+                        .OPERATION_ABORTED,
+
+                        // Master pipe was force-closed by `Exec.threadExit`
+                        // because CancelIoEx is a no-op on ConPTY-backed
+                        // pipes when the child is still flushing output.
+                        // Treat the same as a quit signal.
+                        .INVALID_HANDLE,
+                        .BROKEN_PIPE,
+                        => break,
 
                         else => {
                             log.err("io reader error err={}", .{err});

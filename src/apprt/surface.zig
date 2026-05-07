@@ -145,12 +145,30 @@ pub const Mailbox = struct {
         // Surface message sending is actually implemented on the app
         // thread, so we have to rewrap the message with our surface
         // pointer and send it to the app thread.
+        //
+        // Cap any caller-requested `.forever` to 1 s. Otherwise, IO /
+        // renderer threads pushing here can deadlock the whole app:
+        // app.mailbox is drained only by the UI thread, but the UI
+        // thread routinely waits on these threads inside
+        // `closeTabByIndex` -> `core_surface.deinit` (joins renderer,
+        // io, io-reader, proc-watcher). When app.mailbox is saturated
+        // (heavy spam, e.g. `.claude/tab-spam.ahk` blasting OSC 2
+        // titles across many tabs), the worker about to be joined is
+        // stuck here in `cond_not_full` and the UI is stuck in
+        // `WaitForSingleObject` on its handle. Dropping a single
+        // surface_message in that pathological state is harmless
+        // (terminal state is reconciled by subsequent messages) and
+        // breaks the deadlock.
+        const effective: App.Mailbox.Queue.Timeout = switch (timeout) {
+            .forever => .{ .ns = std.time.ns_per_s },
+            else => timeout,
+        };
         return self.app.push(.{
             .surface_message = .{
                 .surface = self.surface,
                 .message = msg,
             },
-        }, timeout);
+        }, effective);
     }
 };
 

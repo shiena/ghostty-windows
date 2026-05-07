@@ -29,6 +29,7 @@ pub const STARTUPINFOW = windows.STARTUPINFOW;
 pub const STARTF_USESTDHANDLES = windows.STARTF_USESTDHANDLES;
 pub const SYNCHRONIZE = windows.SYNCHRONIZE;
 pub const WAIT_FAILED = windows.WAIT_FAILED;
+pub const WAIT_TIMEOUT = windows.WAIT_TIMEOUT;
 pub const FALSE = windows.FALSE;
 pub const TRUE = windows.TRUE;
 
