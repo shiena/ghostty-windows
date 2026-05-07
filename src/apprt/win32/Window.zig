@@ -335,7 +335,12 @@ pub fn addTab(self: *Window) !*Surface {
 
     const alloc = self.app.core_app.alloc;
     const surface = try alloc.create(Surface);
-    try surface.init(self.app, self, .tab);
+    surface.init(self.app, self, .tab) catch |err| {
+        // surface.init's errdefers have cleaned up its own state, but
+        // the heap allocation itself is ours to free.
+        alloc.destroy(surface);
+        return err;
+    };
     // After surface.init succeeds, create the SplitTree which takes ownership
     // via ref(). If this fails, we manually clean up.
     var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
