@@ -16,6 +16,7 @@ const App = @import("App.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
+const gl = @import("opengl");
 
 const log = std.log.scoped(.win32);
 
@@ -314,6 +315,13 @@ pub fn deinit(self: *Surface) void {
     log.debug("surface deinit: frame_event closed", .{});
 
     if (self.hglrc) |hglrc| {
+        // NVIDIA's GL driver (nvoglv64) crashes in DrvPresentBuffers
+        // with a null deref when the context is deleted while frames
+        // are still queued. Force the driver to drain any pending GPU
+        // work before the context goes away.
+        // The context is current on this UI thread because
+        // core_surface.deinit's `renderer.threadEnter` reclaimed it.
+        gl.finish();
         log.debug("surface deinit: wglMakeCurrent(null)", .{});
         _ = w32.wglMakeCurrent(null, null);
         log.debug("surface deinit: wglDeleteContext", .{});
